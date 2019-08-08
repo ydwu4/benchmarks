@@ -522,10 +522,10 @@ flags.DEFINE_integer('fp16_inc_loss_scale_every_n', 1000,
 flags.DEFINE_enum('variable_update', 'parameter_server',
                   ('parameter_server', 'replicated', 'distributed_replicated',
                    'independent', 'distributed_all_reduce',
-                   'collective_all_reduce', 'horovod'),
+                   'collective_all_reduce', 'horovod', 'edl'),
                   'The method for managing variables: parameter_server, '
                   'replicated, distributed_replicated, independent, '
-                  'distributed_all_reduce, collective_all_reduce, horovod')
+                  'distributed_all_reduce, collective_all_reduce, horovod edl')
 flags.DEFINE_string('all_reduce_spec', None,
                     'A specification of the all_reduce algorithm to be used '
                     'for reducing gradients.  For more details, see '
@@ -747,6 +747,11 @@ def create_config_proto(params):
   if params.variable_update == 'horovod':
     import horovod.tensorflow as hvd  # pylint: disable=g-import-not-at-top
     config.gpu_options.visible_device_list = str(hvd.local_rank())
+  elif params.variable_update == 'edl':
+    import edl.tensorflow as ehvd # pylint: disable=g-import-not-at-top
+    print ("edl: config visible GPUs "+ os.environ.get('VISIBLE_DEVICES', '0'))
+    config.gpu_options.visible_device_list = os.environ.get('VISIBLE_DEVICES', '0')
+
 
   return config
 
@@ -1283,7 +1288,7 @@ class BenchmarkCNN(object):
         self.params.gradient_repacking):
       raise ValueError('--fp16_vars cannot be used with --gradient_repacking')
 
-    if self.params.variable_update == 'horovod' and self.params.num_gpus > 1:
+    if (self.params.variable_update == 'horovod' or self.params.variable_update == 'edl') and self.params.num_gpus > 1:
       raise ValueError('Horovod benchmarks require num_gpus=1 on each worker')
 
     if self.params.variable_update == 'horovod' and self.params.job_name:
@@ -1427,6 +1432,9 @@ class BenchmarkCNN(object):
     elif self.params.variable_update == 'horovod':
       import horovod.tensorflow as hvd  # pylint: disable=g-import-not-at-top
       self.num_workers = hvd.size()
+    elif self.params.variable_update == 'edl':
+      import edl.tensorflow as ehvd
+      self.num_workers = ehvd.size()  # pylint: disable=g-import-not-at-top
     else:
       self.num_workers = 1
     self.num_ps = self.cluster_manager.num_ps() if self.cluster_manager else 0
@@ -1544,7 +1552,7 @@ class BenchmarkCNN(object):
         raise ValueError('Invalid variable_update in local mode: %s' %
                          self.params.variable_update)
       self.variable_mgr = variable_mgr.VariableMgrDistributedReplicated(self)
-    elif self.params.variable_update in ('independent', 'horovod'):
+    elif self.params.variable_update in ('independent', 'horovod', 'edl'):
       if self.job_name:
         raise ValueError('Invalid variable_update in distributed mode: %s' %
                          self.params.variable_update)
@@ -1695,6 +1703,8 @@ class BenchmarkCNN(object):
       log_fn('Staged vars: %s' % self.params.staged_vars)
     if self.params.variable_update == 'horovod' and self.params.horovod_device:
       log_fn('Horovod on:  %s' % self.params.horovod_device)
+    if self.params.variable_update == 'edl':
+      log_fn('edl on:  GPU')
     log_fn('==========')
 
   def _get_params_info(self):
@@ -1709,7 +1719,7 @@ class BenchmarkCNN(object):
     single_session = self.params.variable_update == 'distributed_all_reduce'
     if single_session:
       device_list = self.raw_devices_across_tasks()
-    elif self.params.variable_update == 'horovod':
+    elif self.params.variable_update == 'horovod' or self.params.variable_update == 'edl':
       device_list = ['horovod/%s:%d' % (self.params.device, idx)
                      for idx in range(self.num_workers)]
     else:
@@ -2072,6 +2082,9 @@ class BenchmarkCNN(object):
       # First worker will be 'chief' - it will write summaries and
       # save checkpoints.
       is_chief = hvd.rank() == 0
+    elif self.params.variable_update == 'edl':
+      print("edl is_chief?" + os.environ['HOROVOD_IS_COORDINATOR'])
+      is_chief = bool(os.environ['HOROVOD_IS_COORDINATOR'])
     else:
       is_chief = (not self.job_name or self.task_index == 0)
 
@@ -2119,6 +2132,9 @@ class BenchmarkCNN(object):
     if self.params.variable_update == 'horovod':
       import horovod.tensorflow as hvd  # pylint: disable=g-import-not-at-top
       bcast_global_variables_op = hvd.broadcast_global_variables(0)
+    elif self.params.variable_update == 'edl':
+      import edl.tensorflow as ehvd # pylint: disable=g-import-not-at-top
+      bcast_global_variables_op = ehvd.broadcast_global_variables(0)
     else:
       bcast_global_variables_op = None
 
@@ -2142,7 +2158,7 @@ class BenchmarkCNN(object):
         # For the purpose of Supervisor, all Horovod workers are 'chiefs',
         # since we want session to be initialized symmetrically on all the
         # workers.
-        is_chief=is_chief or (self.params.variable_update == 'horovod'
+        is_chief=is_chief or (self.params.variable_update == 'horovod' or self.params.variable_update == 'edl'
                               or self.distributed_collective),
         # Log dir should be unset on non-chief workers to prevent Horovod
         # workers from corrupting each other's checkpoints.
@@ -2220,6 +2236,9 @@ class BenchmarkCNN(object):
     if self.params.backbone_model_path is not None:
       self.model.load_backbone_model(sess, self.params.backbone_model_path)
     if bcast_global_variables_op:
+      if self.params.variable_update == 'edl':
+        import edl.tensorflow as ehvd
+        ehvd.try_reinit_nccl()
       sess.run(bcast_global_variables_op)
     image_producer = None
     if graph_info.input_producer_op is not None:
@@ -2644,6 +2663,9 @@ class BenchmarkCNN(object):
     if self.params.variable_update == 'horovod':
       import horovod.tensorflow as hvd  # pylint: disable=g-import-not-at-top
       seed_adjustment = hvd.rank()
+    elif self.params.variable_update == 'edl':
+      import edl.tensorflow as ehvd  # pylint: disable=g-import-not-at-top
+      seed_adjustment = ehvd.rank()
     else:
       seed_adjustment = 0
     tf.set_random_seed(self.params.tf_random_seed + seed_adjustment)
@@ -2769,6 +2791,7 @@ class BenchmarkCNN(object):
 
     # TODO(reedwm): Greatly simplify the learning rate code.
     if (self.params.variable_update == 'horovod' or
+        self.params.variable_update == 'edl' or
         self.params.variable_update == 'collective_all_reduce'):
       # Each worker independently increments global_step.
       examples_per_step = self.batch_size * self.num_workers
@@ -3109,6 +3132,7 @@ class BenchmarkCNN(object):
       weight_decay = self.params.weight_decay
       if (weight_decay is not None and weight_decay != 0. and
           l2_loss is not None):
+          # TODO(edl): correctness required modification: change len(self.devices) to a feed dict member
         total_loss += len(self.devices) * weight_decay * l2_loss
 
       aggmeth = tf.AggregationMethod.DEFAULT
@@ -3140,6 +3164,11 @@ class BenchmarkCNN(object):
           horovod_device = ''
         # All-reduce gradients using Horovod.
         grads = [hvd.allreduce(grad, average=False, device_dense=horovod_device)
+                 for grad in grads]
+      elif self.params.variable_update == 'edl':
+        import edl.tensorflow as ehvd  # pylint: disable=g-import-not-at-top
+        # All-reduce gradients using edl.
+        grads = [ehvd.allreduce(grad, average=False, device_dense='gpu')
                  for grad in grads]
 
       if self.params.staged_vars:
@@ -3388,6 +3417,12 @@ def setup(params):
   if params.variable_update == 'horovod':
     import horovod.tensorflow as hvd  # pylint: disable=g-import-not-at-top
     hvd.init()
+
+  # edl needs to be initialized before create_config_proto() call since
+  # it will be used in config generation if enabled
+  if params.variable_update == 'edl':
+    import edl.tensorflow as ehvd
+    ehvd.init()
 
   platforms_util.initialize(params, create_config_proto(params))
 
